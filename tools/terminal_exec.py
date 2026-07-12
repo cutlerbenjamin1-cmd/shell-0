@@ -1,5 +1,5 @@
 """
-Terminal execution tool - unrestricted for Claude Code usage.
+Terminal execution tool - unrestricted shell command execution.
 Simple asyncio subprocess with proper stdin isolation.
 """
 import asyncio
@@ -96,9 +96,6 @@ def _log_terminal_exec(command: str, cwd: Optional[str] = None, success: bool = 
         pass  # Don't fail execution due to audit logging
 
 
-COMMAND_HISTORY: List[dict] = []
-MAX_HISTORY = 100
-
 # ============================================================
 #   BACKGROUND TASKS
 # ============================================================
@@ -123,17 +120,6 @@ class BackgroundTask:
 
 
 BACKGROUND_TASKS: Dict[str, BackgroundTask] = {}
-
-
-def _add_history(command: str, success: bool, cwd: Optional[str] = None) -> None:
-    COMMAND_HISTORY.append({
-        "timestamp": datetime.now().isoformat(),
-        "command": command,
-        "cwd": cwd,
-        "success": success,
-    })
-    if len(COMMAND_HISTORY) > MAX_HISTORY:
-        COMMAND_HISTORY.pop(0)
 
 
 def _bg_cleanup() -> None:
@@ -204,7 +190,6 @@ async def _bg_collector(task: BackgroundTask, timeout: float) -> None:
         task.output = f"[Background collector error: {e}]"
 
     task.end_time = time.time()
-    _add_history(task.command, task.status == "completed", task.cwd)
     _log_terminal_exec(
         task.command, cwd=task.cwd,
         success=(task.status == "completed"),
@@ -309,7 +294,6 @@ async def terminal_exec(
         except asyncio.TimeoutError:
             _kill_proc(proc)
             await proc.wait()
-            _add_history(command, False, cwd)
             _log_terminal_exec(command, cwd=cwd, success=False, error=f"Timeout after {timeout}s")
             return {
                 "success": False,
@@ -321,7 +305,6 @@ async def terminal_exec(
         
         duration = time.time() - start
         success = exit_code == 0
-        _add_history(command, success, cwd)
         
         # Build output
         output = ""
@@ -347,7 +330,6 @@ async def terminal_exec(
         }
     
     except Exception as e:
-        _add_history(command, False, cwd)
         _log_terminal_exec(command, cwd=cwd, success=False, error=str(e))
         return {
             "success": False,
@@ -355,14 +337,6 @@ async def terminal_exec(
             "command": command,
             "cwd": cwd,
         }
-
-
-def terminal_history(count: int = 20) -> Dict:
-    """Return recent command history."""
-    if not COMMAND_HISTORY:
-        return {"success": True, "history": []}
-    count = max(1, min(count, len(COMMAND_HISTORY)))
-    return {"success": True, "count": count, "history": COMMAND_HISTORY[-count:]}
 
 
 # ============================================================
@@ -405,7 +379,6 @@ async def _do_bg_kill(task_id: str) -> Dict:
     task.output = "[Killed by user]"
     if task._collector and not task._collector.done():
         task._collector.cancel()
-    _add_history(task.command, False, task.cwd)
     _log_terminal_exec(task.command, cwd=task.cwd, success=False, error="Killed by user")
     return {"success": True, "task_id": task_id, "status": "killed"}
 

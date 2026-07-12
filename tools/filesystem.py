@@ -1,5 +1,5 @@
 # tools/filesystem.py
-# Claude Code version - FULL ACCESS (no sandbox restrictions)
+# Full filesystem access - no sandbox restrictions.
 
 import shutil
 import asyncio
@@ -125,7 +125,7 @@ def _read_file_for_audit(path: Path) -> Optional[str]:
     return None
 
 # =====================================================================================
-# CONFIGURATION - Claude Code version has FULL filesystem access
+# CONFIGURATION - full filesystem access, no sandbox
 # =====================================================================================
 
 MAX_READ_BYTES = int(os.getenv("FS_MAX_READ_BYTES", str(50 * 1024 * 1024)))  # 50MB default
@@ -137,7 +137,7 @@ SANDBOXED = False
 
 
 # =====================================================================================
-# AUTO-FIXER FOR CODE FILES (ported from python_runner.py)
+# AUTO-FIXER FOR CODE FILES
 # =====================================================================================
 
 import ast
@@ -152,7 +152,7 @@ TEXT_EXTENSIONS = {'.py', '.pyw', '.js', '.ts', '.jsx', '.tsx', '.json', '.yaml'
 
 
 def _normalize_escaped_newlines(content: str) -> str:
-    """Convert literal \\n sequences to actual newlines (LM Studio fix)."""
+    """Convert literal \\n sequences to actual newlines."""
     if "\\n" in content:
         content = content.replace("\\r\\n", "\n").replace("\\n", "\n")
     return content
@@ -206,24 +206,6 @@ def _strip_code_fences(content: str) -> str:
     return content
 
 
-def _fix_json_booleans(content: str) -> str:
-    """Convert JSON-style true/false/null to Python True/False/None."""
-    if not any(tok in content for tok in ("true", "false", "null")):
-        return content
-    try:
-        string_spans = [(m.start(), m.end()) for m in re.finditer(r'(["\'])(?:(?=(\\?))\2.)*?\1', content)]
-        def in_string(pos):
-            return any(start <= pos < end for start, end in string_spans)
-        def replacer(match):
-            if in_string(match.start()):
-                return match.group(0)
-            word = match.group(0)
-            return {"true": "True", "false": "False", "null": "None"}.get(word, word)
-        return re.sub(r'\b(true|false|null)\b', replacer, content)
-    except Exception:
-        return content
-
-
 def _validate_python_syntax(content: str) -> tuple:
     """Validate Python syntax. Returns (is_valid, error_message)."""
     try:
@@ -240,7 +222,7 @@ def _autofix_content(content: str, path: str, validate: bool = True) -> tuple:
     Repair-only-if-broken: for parseable formats (.py, .json) content that
     already parses is never modified, and a repair is only kept if it makes
     the content parse. Generic text gets the escaped-newline fix only when
-    the content is a single-line blob (the LM Studio failure mode) - real
+    the content is a single-line blob - real
     multi-line files containing literal \\n (shell printf, regex, JSON-in-md)
     must not be touched.
 
@@ -280,8 +262,8 @@ def _autofix_content(content: str, path: str, validate: bool = True) -> tuple:
         if content != original:
             warnings.append("Stripped code fences")
 
-        # NOTE: Removed _fix_json_booleans - it breaks JS code in Python f-strings
-        # (e.g., visualize_kg.py has JS true/false that got converted to True/False)
+        # No JSON-boolean coercion for .py files: it corrupts embedded JS/JSON
+        # true/false/null literals sitting inside Python strings.
 
         is_valid, error = _validate_python_syntax(content)
         if not is_valid:
@@ -329,7 +311,7 @@ def _resolve_path(path: str) -> Path:
     - Absolute paths (C:\..., /home/..., etc.)
     - Relative paths (resolved from cwd)
 
-    No sandbox restrictions in Claude Code version.
+    No sandbox restrictions.
     """
     if not isinstance(path, str) or not path.strip():
         raise ValueError("Invalid path parameter")

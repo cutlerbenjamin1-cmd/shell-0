@@ -1,5 +1,5 @@
 """
-Python execution tool - partially unlocked for Claude Code usage.
+Python execution tool - unlocked execution with resource guards.
 Keeps resource guards (timeout, size, AST complexity) but allows all imports and file access.
 """
 import io
@@ -271,7 +271,7 @@ UNLOCKED_GLOBALS = {
 }
 
 # ============================================================
-#   NORMALIZE ESCAPED NEWLINES (LM Studio fix)
+#   NORMALIZE ESCAPED NEWLINES
 # ============================================================
 
 def _normalize_escaped_newlines(code: str) -> str:
@@ -289,24 +289,6 @@ def _maybe_unwrap_quotes(code: str) -> str:
     if (code.startswith('"') and code.endswith('"')) or (code.startswith("'") and code.endswith("'")):
         return code[1:-1]
     return code
-
-
-def _fix_json_style(code: str) -> str:
-    import re
-    if not any(tok in code for tok in ("true", "false", "null")):
-        return code
-    try:
-        string_spans = [(m.start(), m.end()) for m in re.finditer(r'(["\'])(?:(?=(\\?))\\2.)*?\\1', code)]
-        def in_string(pos):
-            return any(start <= pos < end for start, end in string_spans)
-        def replacer(match):
-            if in_string(match.start()):
-                return match.group(0)
-            word = match.group(0)
-            return {"true": "True", "false": "False", "null": "None"}.get(word, word)
-        return re.sub(r'\b(true|false|null)\b', replacer, code)
-    except Exception:
-        return code
 
 
 # Recognized fence language tags. Only these get stripped as a language line -
@@ -368,11 +350,10 @@ def _auto_fix(code: str) -> str:
     gets unwrapped if the inner text parses. Broken code gets fence-stripping
     then quote-unwrapping; a fix is kept only if the result parses.
 
-    NOTE: Removed _fix_json_style from the pipeline - its in-string guard
-    used mangled backreferences (literal \\1/\\2 instead of backrefs), so it
-    rewrote true/false/null INSIDE string literals, and even a corrected
-    guard can't protect triple-quoted strings. Bare `true` parses fine
-    anyway, so a parse gate would never trigger it.
+    NOTE: Python source deliberately gets no true/false/null -> True/False/None
+    coercion. Bare true/false/null parse fine as names, and rewriting them
+    would corrupt those tokens inside string and triple-quoted literals; a
+    parse gate would never trigger it anyway.
     """
     if not isinstance(code, str):
         return code
@@ -466,11 +447,24 @@ def _build_error_payload(exc, stdout: str, stderr: str, fallback_output: str = "
 class Timeout(Exception):
     pass
 
+
+def _preload_extended_imports() -> None:
+    """Best-effort pre-import of numpy (np) and pandas (pd) into the persistent env."""
+    if "__builtins__" not in GLOBAL_ENV:
+        GLOBAL_ENV.update(UNLOCKED_GLOBALS)
+    for module_name, alias in (("numpy", "np"), ("pandas", "pd")):
+        if alias in GLOBAL_ENV:
+            continue
+        try:
+            GLOBAL_ENV[alias] = __import__(module_name)
+        except ImportError:
+            pass
+
 # ============================================================
-#   MAIN EXECUTOR (async, LM Studio compatible)
+#   MAIN EXECUTOR (async)
 # ============================================================
 
-async def exec_python(code: str, extended_imports: bool = None) -> dict:
+async def exec_python(code: str, extended_imports: bool = False) -> dict:
     """
     Execute Python code in a persistent environment.
     
@@ -486,8 +480,11 @@ async def exec_python(code: str, extended_imports: bool = None) -> dict:
     
     Args:
         code: Python code to execute
-        extended_imports: Ignored (kept for API compatibility)
+        extended_imports: When True, pre-import numpy (as np) and pandas (as pd)
+                          into the persistent namespace if they are installed.
     """
+    if extended_imports:
+        _preload_extended_imports()
     return await _exec_python_inner(code)
 
 

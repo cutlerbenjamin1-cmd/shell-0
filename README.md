@@ -50,6 +50,14 @@ shell-0 speaks MCP over stdio. Point your client at `server.py`. A Claude Deskto
 
 Use an absolute path to `server.py`. On Windows, if `python` is not on PATH, use the full path to `python.exe`, and either forward slashes or escaped backslashes in the paths. There is a ready-to-edit copy in `example_config.json`.
 
+## Running over HTTP (optional)
+
+shell-0 speaks stdio. If your MCP client wants HTTP instead (llama.cpp's web UI, OpenWebUI, and similar), there is a companion bridge that serves shell-0 over MCP streamable HTTP: [mcp-http-bridge](https://github.com/cutlerbenjamin1-cmd/mcp-http-bridge). Run it from this directory and point your client at `http://127.0.0.1:8818/mcp`.
+
+> **WARNING: do not expose shell-0's tools over the network without thinking hard first.**
+>
+> shell-0's tools (`terminal`, `python_exec`, `js_exec`, `fs`) run unsandboxed with your full privileges. Serving them over HTTP on anything other than `127.0.0.1` hands remote code execution to anyone who can reach the port. The bridge ships a filter that disables every execution tool by default for exactly this reason. Leave it that way unless you have put real authentication and TLS in front of it, and even then only enable what you actually need.
+
 ## Configuration
 
 All optional, set as environment variables:

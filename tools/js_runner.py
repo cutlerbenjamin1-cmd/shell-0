@@ -237,18 +237,3 @@ async def exec_js(code: str, timeout: float = None) -> dict:
         if script_path and os.path.exists(script_path):
             with contextlib.suppress(Exception):
                 os.remove(script_path)
-
-
-async def clear_js_state() -> dict:
-    """Clear the persistent JavaScript state file."""
-    state_path = os.path.join(os.getcwd(), STATE_FILE_NAME)
-    try:
-        if os.path.exists(state_path):
-            os.remove(state_path)
-        return {"success": True, "message": "JavaScript state cleared."}
-    except Exception as exc:
-        return {
-            "success": False,
-            "error": {"type": exc.__class__.__name__, "message": str(exc)},
-            "output": str(exc),
-        }
