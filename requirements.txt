@@ -1,0 +1,10 @@
+# shell-0 runtime dependency (the MCP Python SDK).
+# Tested with mcp 1.22.0 on Python 3.12.
+mcp>=1.2.0
+
+# js_exec also needs Node.js on PATH (tested with Node 24). Not a pip package;
+# install from https://nodejs.org if you want the js_exec tool.
+
+# Optional: let python_exec(extended_imports=true) pre-import these if present.
+# numpy
+# pandas

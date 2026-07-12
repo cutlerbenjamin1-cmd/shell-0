@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "shell-0": {
+      "command": "python",
+      "args": ["/absolute/path/to/shell-0/server.py"]
+    }
+  }
+}

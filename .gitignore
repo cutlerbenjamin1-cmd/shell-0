@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# shell-0 forensic audit output: keep the dir skeleton, ignore the logs.
+data/fs_audit/*
+data/exec_audit/*
+!data/fs_audit/.gitkeep
+!data/exec_audit/.gitkeep
+
+# js_exec persistent state (written to the working dir)
+.shell0_js_state.json
+
+# local scratch / working copies
+_smoke_test.py
+_smoke_scratch.txt
+server_reference.py
+
+# logs, editors, OS cruft
+*.log
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
