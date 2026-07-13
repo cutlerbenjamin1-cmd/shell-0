@@ -27,15 +27,39 @@ Move it with `FS_AUDIT_ROOT` / `EXEC_AUDIT_ROOT`, or turn it off entirely with `
 
 Requires Python 3.10 or newer (tested on 3.12).
 
+Install as a package to get a `shell-0` command on your PATH (recommended - an isolated installer keeps it off your system Python):
+
+```
+pipx install git+https://github.com/cutlerbenjamin1-cmd/shell-0
+# or run it ad-hoc without a checkout:
+uvx --from git+https://github.com/cutlerbenjamin1-cmd/shell-0 shell-0
+```
+
+From a local checkout: `pip install .`
+
+Or skip packaging entirely, install the one dependency, and run `server.py` directly:
+
 ```
 pip install -r requirements.txt
 ```
 
-For `js_exec`, install Node.js from https://nodejs.org and make sure `node` is on your PATH. The other three tools have no dependencies beyond the MCP SDK.
+For `js_exec`, install Node.js from https://nodejs.org and make sure `node` is on your PATH. `python_exec(extended_imports=true)` can pre-import numpy/pandas if you add the extra: `pip install "shell-0[extended]"`.
 
 ## Use it with an MCP client
 
-shell-0 speaks MCP over stdio. Point your client at `server.py`. A Claude Desktop style config looks like this:
+shell-0 speaks MCP over stdio. If you installed the package, point your client at the `shell-0` command:
+
+```json
+{
+  "mcpServers": {
+    "shell-0": {
+      "command": "shell-0"
+    }
+  }
+}
+```
+
+If you did not install it as a package, point `python` at `server.py` with an absolute path instead:
 
 ```json
 {
@@ -48,7 +72,7 @@ shell-0 speaks MCP over stdio. Point your client at `server.py`. A Claude Deskto
 }
 ```
 
-Use an absolute path to `server.py`. On Windows, if `python` is not on PATH, use the full path to `python.exe`, and either forward slashes or escaped backslashes in the paths. There is a ready-to-edit copy in `example_config.json`.
+On Windows, if the command is not found, use the full path to the installed `shell-0.exe` (in your pipx/venv Scripts directory) or to `python.exe`, with forward slashes or escaped backslashes. There is a ready-to-edit copy in `example_config.json`.
 
 ## Running over HTTP (optional)
 
@@ -56,7 +80,7 @@ shell-0 speaks stdio. If your MCP client wants HTTP instead (llama.cpp's web UI,
 
 > **WARNING: do not expose shell-0's tools over the network without thinking hard first.**
 >
-> shell-0's tools (`terminal`, `python_exec`, `js_exec`, `fs`) run unsandboxed with your full privileges. Serving them over HTTP on anything other than `127.0.0.1` hands remote code execution to anyone who can reach the port. The bridge ships a filter that disables every execution tool by default for exactly this reason. Leave it that way unless you have put real authentication and TLS in front of it, and even then only enable what you actually need.
+> shell-0's tools (`terminal`, `python_exec`, `js_exec`, `fs`) run unsandboxed with your full privileges. Serving them over HTTP on anything other than `127.0.0.1` hands remote code execution to anyone who can reach the port - and even on `127.0.0.1`, a web page in any browser tab can reach a loopback port, which is why the bridge validates the `Origin` header. The bridge ships a filter that disables every execution tool **and `fs`** by default (arbitrary file write is RCE-equivalent), rejects unknown browser origins, and supports a shared-secret header. Leave those defaults unless you have put real authentication and TLS in front of it, and even then only enable what you actually need.
 
 ## Configuration
 

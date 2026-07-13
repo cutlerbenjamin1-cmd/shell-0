@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "shell-0"
+version = "0.1.0"
+description = "MCP server for unsandboxed local system access: fs, python_exec, js_exec, terminal, with a forensic audit trail."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "cutlerbenjamin1-cmd" }]
+keywords = ["mcp", "model-context-protocol", "shell", "filesystem", "code-execution"]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "mcp>=1.2.0,<2",
+]
+
+[project.optional-dependencies]
+# python_exec(extended_imports=true) pre-imports these if present. js_exec also
+# needs Node.js on PATH (not a pip package).
+extended = ["numpy", "pandas"]
+
+[project.scripts]
+shell-0 = "server:run"
+
+[project.urls]
+Homepage = "https://github.com/cutlerbenjamin1-cmd/shell-0"
+Repository = "https://github.com/cutlerbenjamin1-cmd/shell-0"
+
+[tool.setuptools]
+py-modules = ["server"]
+packages = ["tools"]
