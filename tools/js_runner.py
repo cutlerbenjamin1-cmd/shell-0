@@ -10,6 +10,8 @@ import os
 import subprocess
 import tempfile
 import shutil
+from datetime import datetime
+from pathlib import Path
 from typing import Tuple
 
 # ============================================================
@@ -26,6 +28,81 @@ EXECUTION_TIMEOUT_SECONDS = int(os.getenv("JS_EXEC_TIMEOUT", "30"))
 # ============================================================
 
 STATE_FILE_NAME = ".shell0_js_state.json"
+
+
+# ============================================================
+#   AUDIT LOGGING
+# ============================================================
+
+# Audit is ON by default. Repo-relative path so it never writes outside the repo.
+# Relocate with EXEC_AUDIT_ROOT; disable entirely with SHELL0_AUDIT_DISABLE=1.
+_DEFAULT_EXEC_AUDIT_ROOT = Path(__file__).resolve().parent.parent / "data" / "exec_audit"
+AUDIT_DISABLED = os.getenv("SHELL0_AUDIT_DISABLE", "").strip().lower() in ("1", "true", "yes", "on")
+EXEC_AUDIT_ROOT = Path(os.getenv("EXEC_AUDIT_ROOT", str(_DEFAULT_EXEC_AUDIT_ROOT)))
+EXEC_AUDIT_MAX_SIZE_MB = int(os.getenv("EXEC_AUDIT_MAX_MB", "50"))
+EXEC_AUDIT_SESSION_DIR = None
+
+# Serialize js_exec so concurrent calls cannot race the shared on-disk state file.
+_JS_STATE_LOCK = asyncio.Lock()
+
+
+def _get_exec_audit_session_dir():
+    """Get or create the current session's audit directory."""
+    global EXEC_AUDIT_SESSION_DIR
+    if EXEC_AUDIT_SESSION_DIR is None:
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        EXEC_AUDIT_SESSION_DIR = EXEC_AUDIT_ROOT / timestamp
+        EXEC_AUDIT_SESSION_DIR.mkdir(parents=True, exist_ok=True)
+        _prune_old_exec_sessions()
+    return EXEC_AUDIT_SESSION_DIR
+
+
+def _get_exec_audit_folder_size():
+    """Total size of the audit folder in bytes."""
+    total = 0
+    if EXEC_AUDIT_ROOT.exists():
+        for f in EXEC_AUDIT_ROOT.rglob("*"):
+            if f.is_file():
+                try:
+                    total += f.stat().st_size
+                except OSError:
+                    pass
+    return total
+
+
+def _prune_old_exec_sessions():
+    """Delete oldest session folders until under the size limit (FIFO)."""
+    max_bytes = EXEC_AUDIT_MAX_SIZE_MB * 1024 * 1024
+    while _get_exec_audit_folder_size() > max_bytes:
+        sessions = sorted([d for d in EXEC_AUDIT_ROOT.iterdir() if d.is_dir()])
+        if len(sessions) <= 1:
+            break
+        try:
+            shutil.rmtree(sessions[0])
+        except OSError:
+            break
+
+
+def _log_js_exec(code: str, success: bool = True, error: str = "") -> None:
+    """Log JavaScript execution to audit."""
+    if AUDIT_DISABLED:
+        return
+    try:
+        session_dir = _get_exec_audit_session_dir()
+        timestamp = datetime.now().strftime("%H-%M-%S_%f")
+        status = "ok" if success else "err"
+        audit_file = session_dir / f"{timestamp}_js_{status}.js"
+        with open(audit_file, "w", encoding="utf-8") as f:
+            print("// AUDIT: JavaScript execution", file=f)
+            print(f"// Timestamp: {datetime.now().isoformat()}", file=f)
+            print(f"// Success: {success}", file=f)
+            if error:
+                print(f"// Error: {error}", file=f)
+            print("// " + "=" * 70, file=f)
+            print(file=f)
+            f.write(code)
+    except Exception:
+        pass  # Don't fail execution due to audit logging
 
 
 class ResourceLimitError(Exception):
@@ -155,12 +232,14 @@ async def exec_js(code: str, timeout: float = None) -> dict:
         code = _strip_code_fences(code)
         _check_source_limits(code)
     except Exception as exc:
+        _log_js_exec(code, success=False, error=str(exc))
         return _build_error_payload(exc, stdout="", stderr="", fallback_output=str(exc))
 
     cwd = os.getcwd()
     state_path = os.path.join(cwd, STATE_FILE_NAME)
     script_path = None
 
+    await _JS_STATE_LOCK.acquire()
     try:
         wrapped_code = _wrap_code_with_state(code, state_path)
         with tempfile.NamedTemporaryFile(
@@ -190,6 +269,7 @@ async def exec_js(code: str, timeout: float = None) -> dict:
             process.kill()
             with contextlib.suppress(Exception):
                 await process.communicate()
+            _log_js_exec(code, success=False, error="Timeout")
             return {
                 "success": False,
                 "stdout": "",
@@ -211,6 +291,7 @@ async def exec_js(code: str, timeout: float = None) -> dict:
 
         if exit_code != 0:
             error_message = stderr_text or f"Process exited with code {exit_code}"
+            _log_js_exec(code, success=False, error=error_message)
             return {
                 "success": False,
                 "stdout": stdout_text,
@@ -221,6 +302,7 @@ async def exec_js(code: str, timeout: float = None) -> dict:
                 "outputTruncated": output_truncated,
             }
 
+        _log_js_exec(code, success=True)
         return {
             "success": True,
             "stdout": stdout_text,
@@ -231,9 +313,11 @@ async def exec_js(code: str, timeout: float = None) -> dict:
         }
 
     except Exception as exc:
+        _log_js_exec(code, success=False, error=str(exc))
         return _build_error_payload(exc, stdout="", stderr="", fallback_output=str(exc))
 
     finally:
+        _JS_STATE_LOCK.release()
         if script_path and os.path.exists(script_path):
             with contextlib.suppress(Exception):
                 os.remove(script_path)
