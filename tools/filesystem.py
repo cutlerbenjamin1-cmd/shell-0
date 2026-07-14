@@ -5,6 +5,8 @@ import shutil
 import asyncio
 import os
 import json
+import re
+import fnmatch
 import tempfile
 import difflib
 import hashlib
@@ -141,7 +143,6 @@ SANDBOXED = False
 # =====================================================================================
 
 import ast
-import re
 
 # File extensions that get Python-specific autofixing
 CODE_EXTENSIONS = {'.py', '.pyw'}
@@ -809,8 +810,6 @@ async def search_files(path: str, pattern: str) -> Dict[str, Any]:
         _log_access("search", str(full), f"pattern='{pattern}'")
 
         def _search():
-            import fnmatch
-
             matched: List[str] = []
             # Determine if pattern is glob-style or substring
             is_glob = "*" in pattern or "?" in pattern
@@ -844,8 +843,6 @@ async def search_files(path: str, pattern: str) -> Dict[str, Any]:
 # =====================================================================================
 # EDIT OPERATION (pattern-based text replacement)
 # =====================================================================================
-
-import difflib
 
 async def edit_file(
     path: str,
@@ -944,7 +941,6 @@ async def edit_file(
 
         if not dry_run and changes_made and edits_failed == 0:
             # Atomic write
-            import tempfile
             fd, temp = tempfile.mkstemp(dir=str(full.parent), suffix=".tmp")
             try:
                 with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -1000,9 +996,6 @@ async def grep_files(
         context_lines: Number of lines before/after match to include
         max_line_length: Max chars per line in output (default 500)
     """
-    import fnmatch
-    import re
-
     try:
         full = _resolve_path(path)
         is_single_file = full.is_file()
