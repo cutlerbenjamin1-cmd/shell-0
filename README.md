@@ -100,3 +100,21 @@ These tools run with your privileges and no sandbox. `terminal` and `python_exec
 ## License
 
 MIT. See LICENSE.
+
+## Testing
+
+shell-0 has a pytest suite (coverage + regression + a live-stdio smoke layer) and
+an interactive driver. Full details, including the regression provenance table,
+are in [`tests/README.md`](tests/README.md).
+
+```bash
+pip install -e ".[test]"     # test deps, into a venv
+
+pytest                       # full sweep
+pytest -m regression         # only the guards for bugs actually hit
+python manual.py             # drive the real server by hand over stdio
+```
+
+The suite is hermetic: every test runs in a temp dir with the forensic audit
+redirected, and never touches paths outside it. The `js_exec` tests skip
+automatically when Node.js isn't on `PATH`.

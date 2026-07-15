@@ -23,6 +23,7 @@ dependencies = [
 # python_exec(extended_imports=true) pre-imports these if present. js_exec also
 # needs Node.js on PATH (not a pip package).
 extended = ["numpy", "pandas"]
+test = ["pytest>=8", "pytest-asyncio>=0.23"]
 
 [project.scripts]
 shell-0 = "server:run"
@@ -34,3 +35,20 @@ Repository = "https://github.com/cutlerbenjamin1-cmd/shell-0"
 [tool.setuptools]
 py-modules = ["server"]
 packages = ["tools"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+asyncio_mode = "auto"
+addopts = "-ra"
+filterwarnings = [
+    # Windows Proactor GCs the subprocess/pipe transports after each per-test
+    # event loop closes, raising benign "Event loop is closed" unraisables.
+    # Deliberate class-level suppression: keeps output readable but WOULD also
+    # hide a genuine unraisable (e.g. a throwing __del__ in product code).
+    # Accepted because the tools define no __del__; revisit if that changes.
+    "ignore::pytest.PytestUnraisableExceptionWarning",
+]
+markers = [
+    "regression: guards a specific bug shell-0 has actually hit (see tests/README.md)",
+]

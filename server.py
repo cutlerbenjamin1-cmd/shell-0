@@ -340,7 +340,10 @@ def _sanitize_surrogates(obj):
     encoded to UTF-8. These cause PydanticSerializationError when MCP serializes.
     """
     if isinstance(obj, str):
-        return obj.encode("utf-8", errors="surrogateescape").decode("utf-8", errors="replace")
+        # errors="replace" drops any surrogate (lone high like \ud83d or the
+        # \udcXX smuggled-byte range); surrogateescape would itself raise on the
+        # lone surrogates this function exists to scrub.
+        return obj.encode("utf-8", errors="replace").decode("utf-8", errors="replace")
     elif isinstance(obj, dict):
         return {k: _sanitize_surrogates(v) for k, v in obj.items()}
     elif isinstance(obj, list):

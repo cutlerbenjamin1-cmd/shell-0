@@ -2,9 +2,13 @@
 __pycache__/
 *.py[cod]
 *.egg-info/
+build/
+dist/
 .venv/
 venv/
 env/
+.pytest_cache/
+.coverage
 
 # shell-0 forensic audit output: keep the dir skeleton, ignore the logs.
 data/fs_audit/*
