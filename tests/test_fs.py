@@ -587,3 +587,93 @@ async def test_audit_prune_caps_single_process_growth(tmp_path, audit_on, monkey
     sess = fsmod.AUDIT_SESSION_DIR
     assert sess is not None and sess.exists()
     assert any(f.is_file() for f in sess.iterdir())
+
+
+@pytest.mark.regression
+async def test_copy_overwrite_snapshots_destination(tmp_path, audit_on):
+    # REGRESSION: copy silently overwrote an existing destination file with no
+    # audit trail - the one thing write_file's overwrite mode already guarded
+    # against. copy must snapshot the clobbered content first. (audit 2026-07-16)
+    src = tmp_path / "src.txt"
+    dst = tmp_path / "dst.txt"
+    src.write_text("new\n", encoding="utf-8")
+    dst.write_text("OLD-TO-RECOVER\n", encoding="utf-8")
+    r = await fsmod.fs(action="copy", path=str(src), destination=str(dst))
+    assert r["success"] is True
+    audited = list(audit_on["fs_audit"].rglob("*copy-overwrite*"))
+    assert audited, "no audit snapshot for a copy that overwrote a destination file"
+    assert "OLD-TO-RECOVER" in audited[0].read_text(encoding="utf-8")
+
+
+@pytest.mark.regression
+async def test_move_overwrite_snapshots_destination(tmp_path, audit_on):
+    # REGRESSION: move silently overwrote an existing destination file (via
+    # os.rename on POSIX or copy+unlink on Windows) with no audit trail.
+    # (audit 2026-07-16)
+    src = tmp_path / "src2.txt"
+    dst = tmp_path / "dst2.txt"
+    src.write_text("moved-in\n", encoding="utf-8")
+    dst.write_text("DESTROYED-BY-MOVE\n", encoding="utf-8")
+    r = await fsmod.fs(action="move", path=str(src), destination=str(dst))
+    assert r["success"] is True
+    audited = list(audit_on["fs_audit"].rglob("*move-overwrite*"))
+    assert audited, "no audit snapshot for a move that overwrote a destination file"
+    assert "DESTROYED-BY-MOVE" in audited[0].read_text(encoding="utf-8")
+
+
+@pytest.mark.regression
+async def test_append_and_insert_are_audited(tmp_path, audit_on):
+    # REGRESSION: only overwrite/replace_lines were snapshotted; append/insert
+    # changed a file's contents with zero audit trail. (audit 2026-07-16)
+    p = tmp_path / "log.txt"
+    p.write_text("base\n", encoding="utf-8")
+    await fsmod.fs(action="write", path=str(p), content="more\n", mode="append")
+    await fsmod.fs(action="write", path=str(p), content="top\n", mode="insert", offset=1)
+    # audit filenames don't encode the write mode (always "..._write_<name>"),
+    # so assert on count: before this fix, append/insert produced zero entries.
+    audits = list(audit_on["fs_audit"].rglob("*_write_log.txt"))
+    assert len(audits) == 2, audits
+    assert "base" in audits[0].read_text(encoding="utf-8")
+
+
+@pytest.mark.regression
+async def test_head_tail_stream_large_file(tmp_path):
+    # REGRESSION: head/tail called f.readlines() on the whole file regardless
+    # of size, defeating the entire point of a head/tail tool for a file too
+    # big to read in full. Now streamed: head stops after N lines, tail keeps
+    # only a bounded deque. (audit 2026-07-16)
+    p = tmp_path / "big.txt"
+    with open(p, "w", encoding="utf-8") as f:
+        for i in range(1, 50_001):
+            f.write(f"line{i}\n")
+
+    h = await fsmod.fs(action="head", path=str(p), lines=3)
+    assert h["content"] == "line1\nline2\nline3\n"
+    assert h["total_lines"] == 50_000
+    assert h["has_more"] is True
+
+    t = await fsmod.fs(action="tail", path=str(p), lines=3)
+    assert t["content"] == "line49998\nline49999\nline50000\n"
+    assert t["total_lines"] == 50_000
+    assert t["start_line"] == 49998
+
+    t0 = await fsmod.fs(action="tail", path=str(p), lines=0)
+    assert t0["content"] == "" and t0["lines_returned"] == 0
+
+
+@pytest.mark.regression
+async def test_chunked_read_streams_not_whole_file(tmp_path):
+    # REGRESSION: read_file's own comment claimed chunked (offset/limit) reads
+    # "allow larger files since we're not loading all at once", but the
+    # implementation called f.readlines() on the entire file regardless of
+    # limit. Now actually streamed. (audit 2026-07-16)
+    p = tmp_path / "chunked.txt"
+    with open(p, "w", encoding="utf-8") as f:
+        for i in range(1, 20_001):
+            f.write(f"row{i}\n")
+
+    r = await fsmod.fs(action="read", path=str(p), offset=10_000, limit=3)
+    assert r["content"] == "row10000\nrow10001\nrow10002\n"
+    assert r["total_lines"] == 20_000
+    assert r["offset"] == 10_000
+    assert r["has_more"] is True

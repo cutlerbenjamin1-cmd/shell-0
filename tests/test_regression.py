@@ -36,6 +36,20 @@ def test_truncate_output_keeps_valid_json_envelope():
     assert out.get("success") is True
 
 
+def test_truncate_output_preserves_error_field():
+    # REGRESSION: the smart truncator's field list didn't include "error", so a
+    # failing call with an oversized *string* error (a huge traceback, stderr
+    # echoed into the field) fell straight to the metadata-only fallback
+    # envelope, which also excludes "error" - the actual failure reason was
+    # silently dropped instead of trimmed. (audit 2026-07-16)
+    big = {"success": False, "error": "E" * 200_000}
+    out = server._truncate_output(big, tool_name="terminal")
+    encoded = json.dumps(out, ensure_ascii=False)
+    assert len(encoded) <= server.OUTPUT_MAX_CHARS
+    assert out.get("success") is False
+    assert "error" in out and "E" in out["error"]
+
+
 async def test_no_output_command_returns_over_stdio(tmp_path):
     # REGRESSION (the original bug in its habitat): a no-output command run
     # through the live MCP stdio server must return, not hang. This is the truest

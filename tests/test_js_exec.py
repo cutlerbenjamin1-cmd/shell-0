@@ -66,3 +66,49 @@ async def test_audit_written_on_success_and_error(workdir, audit_on):
     names = [f.name for f in exec_audit.rglob("*_js_*.js")]
     assert any(n.endswith("_js_ok.js") for n in names), names
     assert any(n.endswith("_js_err.js") for n in names), names
+
+
+@pytest.mark.regression
+async def test_timeout_kills_process_tree(workdir):
+    # REGRESSION: a timeout only killed the node process itself (proc.kill()),
+    # leaving anything it spawned (child_process.spawn) as an orphan. Now
+    # mirrors terminal_exec's tree-kill: taskkill /T /F on Windows, a
+    # process-group SIGKILL on POSIX (node is spawned with
+    # start_new_session=True precisely so it has a group to kill).
+    # (audit 2026-07-16)
+    import json as _json
+    import os as _os
+    import platform
+    import subprocess as _sp
+
+    marker = str(workdir / "pid.json").replace("\\", "\\\\")
+    code = (
+        "const { spawn } = require('child_process');\n"
+        "const fs = require('fs');\n"
+        "const child = spawn(process.execPath, "
+        "['-e', 'setInterval(function(){}, 1000);'], "
+        "{ detached: true, stdio: 'ignore' });\n"
+        "child.unref();\n"
+        f"fs.writeFileSync('{marker}', JSON.stringify({{ pid: child.pid }}));\n"
+        "while (true) {}\n"
+    )
+    r = await jsmod.exec_js(code, timeout=2)
+    assert r["success"] is False
+
+    pid_file = workdir / "pid.json"
+    assert pid_file.exists(), "grandchild never spawned - test inconclusive"
+    pid = _json.loads(pid_file.read_text())["pid"]
+
+    await asyncio.sleep(1.0)
+
+    if platform.system() == "Windows":
+        out = _sp.run(["tasklist", "/FI", f"PID eq {pid}"], capture_output=True, text=True)
+        still_alive = str(pid) in out.stdout
+    else:
+        still_alive = _os.path.exists(f"/proc/{pid}")
+
+    if still_alive:
+        cleanup = (["taskkill", "/T", "/F", "/PID", str(pid)] if platform.system() == "Windows"
+                   else ["kill", "-9", str(pid)])
+        _sp.run(cleanup, capture_output=True)
+    assert not still_alive, "grandchild survived the timeout kill"
