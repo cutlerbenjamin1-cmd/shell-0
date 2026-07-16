@@ -441,3 +441,149 @@ async def test_audit_snapshots_before_state(tmp_path, audit_on):
     blob = "\n".join(s.read_text(encoding="utf-8", errors="replace") for s in snaps)
     assert "ORIGINAL" in blob
     assert p.read_text(encoding="utf-8") == "REPLACED\n"
+
+
+# ---------------------- 2026-07-16 audit pass regressions -------------------
+
+@pytest.mark.regression
+async def test_write_omitted_content_is_rejected(tmp_path):
+    # REGRESSION: `fs(action="write")` with content omitted once truncated the
+    # target to empty - the `content` default of "" defeated the `is None` guard
+    # meant to catch a forgotten payload. Omitting content must error and leave
+    # the file byte-for-byte intact; an explicit "" is still a valid empty write.
+    # (audit 2026-07-16)
+    p = tmp_path / "keep.txt"
+    p.write_text("IMPORTANT\n", encoding="utf-8")
+    r = await fsmod.fs(action="write", path=str(p))  # content omitted entirely
+    assert r["success"] is False
+    assert "content required" in r["error"].lower()
+    assert p.read_text(encoding="utf-8") == "IMPORTANT\n"  # NOT truncated
+    # an explicit empty string remains a legitimate "make this file empty" write
+    r = await fsmod.fs(action="write", path=str(p), content="")
+    assert r["success"] is True
+    assert p.read_text(encoding="utf-8") == ""
+
+
+@pytest.mark.regression
+async def test_edit_rollback_report_is_honest(tmp_path):
+    # REGRESSION: a partial-fail edit batch already rolled back atomically, but
+    # the response claimed changes_made:true with a full applied-looking diff and
+    # match_results marking edits "applied" - all lies, since nothing hit disk.
+    # The report must match disk truth. (commit 84efe0e)
+    p = tmp_path / "r.py"
+    original = "a = 1\nb = 2\n"
+    p.write_text(original, encoding="utf-8")
+    r = await fsmod.fs(action="edit", path=str(p), edits=[
+        {"old_text": "a = 1", "new_text": "a = 10"},      # would match
+        {"old_text": "NOT_PRESENT", "new_text": "q"},      # fails -> whole batch rolls back
+    ])
+    assert r["success"] is False
+    assert r["written"] is False
+    assert r["changes_made"] is False
+    assert r["diff"] == ""
+    assert "warning" in r and "ROLLED BACK" in r["warning"]
+    statuses = {m["status"] for m in r["match_results"]}
+    assert "applied" not in statuses          # the matched edit was relabeled
+    assert "rolled_back" in statuses
+    assert p.read_text(encoding="utf-8") == original
+
+
+@pytest.mark.regression
+async def test_list_metadata_survives_bad_entry(tmp_path, monkeypatch):
+    # REGRESSION: list(include_metadata=True) once failed the ENTIRE listing if a
+    # single entry's stat() raised (broken symlink / Windows reparse point /
+    # OneDrive placeholder). A bad entry must be reported inline, not be fatal.
+    # (audit 2026-07-16)
+    (tmp_path / "good.txt").write_text("x", encoding="utf-8")
+    (tmp_path / "broken.txt").write_text("y", encoding="utf-8")
+
+    real_stat = Path.stat
+    def flaky_stat(self, *a, **k):
+        if self.name == "broken.txt":
+            raise OSError("simulated unreadable entry")
+        return real_stat(self, *a, **k)
+    monkeypatch.setattr(fsmod.Path, "stat", flaky_stat)
+
+    r = await fsmod.fs(action="list", path=str(tmp_path), include_metadata=True)
+    assert r["success"] is True
+    by_name = {e["name"]: e for e in r["items"]}
+    assert by_name["good.txt"]["type"] == "file"
+    assert "error" in by_name["broken.txt"]     # bad entry reported, not fatal
+
+
+async def test_duplicates_sha512(tmp_path):
+    # sha512 must be an accepted algorithm (parity with hash_file's set; it was
+    # missing from find_duplicates' map). (audit 2026-07-16)
+    (tmp_path / "a.bin").write_bytes(b"identical")
+    (tmp_path / "b.bin").write_bytes(b"identical")
+    r = await fsmod.fs(action="duplicates", path=str(tmp_path), algorithm="sha512")
+    assert r["success"] is True
+    assert r["duplicate_groups"] == 1
+
+
+def test_all_exports_every_public_action():
+    # __all__ once omitted 6 of the 20 public helpers (diff/hash/touch/head/tail/
+    # find_duplicates), so `from tools.filesystem import *` silently dropped them.
+    # (audit 2026-07-16)
+    for name in ("diff_content", "hash_file", "touch_file",
+                 "head_file", "tail_file", "find_duplicates"):
+        assert name in fsmod.__all__
+
+
+@pytest.mark.regression
+async def test_rejected_write_leaves_no_phantom_audit(tmp_path, audit_on):
+    # REGRESSION: write_file logged a "write happened" before-state snapshot even
+    # when the write was then rejected (syntax error, path conflict, or a
+    # replace_lines limit<=0) and nothing touched disk - a phantom forensic entry
+    # for a write that never occurred. The log now fires only after the guards.
+    # (audit 2026-07-16)
+    fs_audit = audit_on["fs_audit"]
+    def write_snaps():
+        return list(fs_audit.rglob("*write*"))
+
+    good = tmp_path / "ok.txt"
+    await fsmod.fs(action="write", path=str(good), content="v1\n")
+    await fsmod.fs(action="write", path=str(good), content="v2\n")
+    assert write_snaps(), "a real overwrite must record a before-state snapshot"
+    base = len(write_snaps())
+
+    # syntax-error write on a .py file: rejected before disk, no new snapshot
+    r = await fsmod.fs(action="write", path=str(tmp_path / "bad.py"),
+                       content="def broken(:\n    pass\n")
+    assert r["success"] is False
+    assert len(write_snaps()) == base
+
+    # replace_lines with limit<=0: rejected before disk, no new snapshot
+    r = await fsmod.fs(action="write", path=str(good), content="X\n", mode="replace_lines")
+    assert r["success"] is False
+    assert len(write_snaps()) == base
+    assert good.read_text(encoding="utf-8") == "v2\n"  # untouched by the rejects
+
+
+@pytest.mark.regression
+async def test_audit_prune_caps_single_process_growth(tmp_path, audit_on, monkeypatch):
+    # REGRESSION: the audit size cap once pruned only once per process (at the
+    # first write), so a single long-lived session's OWN growth was never
+    # re-checked - it grew unbounded. Pruning now runs on every write, at file
+    # granularity, and must never delete the current session dir out from under
+    # itself (a bug briefly introduced and caught during this fix). (audit 2026-07-16)
+    fs_audit = audit_on["fs_audit"]
+    monkeypatch.setattr(fsmod, "AUDIT_MAX_SIZE_MB", 1)   # 1 MB cap
+    monkeypatch.setattr(fsmod, "AUDIT_SESSION_DIR", None)
+
+    payload = "A" * 50_000
+    target = tmp_path / "churn.txt"
+
+    def folder_bytes():
+        return sum(f.stat().st_size for f in fs_audit.rglob("*") if f.is_file())
+
+    # 40 * ~50KB before-snapshots = ~2MB if never pruned; the cap must hold it down
+    for i in range(40):
+        await fsmod.fs(action="write", path=str(target), content=payload + str(i))
+
+    cap = 1 * 1024 * 1024
+    assert folder_bytes() <= cap * 1.5, "audit folder grew past the cap (prune not running per-write)"
+    # the current session survived and still holds records => audit still working
+    sess = fsmod.AUDIT_SESSION_DIR
+    assert sess is not None and sess.exists()
+    assert any(f.is_file() for f in sess.iterdir())
