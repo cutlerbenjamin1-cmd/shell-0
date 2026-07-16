@@ -20,7 +20,6 @@ import contextlib
 import traceback
 import ast
 import platform
-import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -39,13 +38,18 @@ EXEC_AUDIT_SESSION_DIR: Optional[Path] = None
 
 
 def _get_exec_audit_session_dir() -> Path:
-    """Get or create the current session's audit directory."""
+    """Get or create the current session's audit directory.
+
+    Prunes on every call, not just when the session directory is first
+    created - otherwise a single long-running process's own audit growth is
+    never re-checked against the size cap after the first write.
+    """
     global EXEC_AUDIT_SESSION_DIR
     if EXEC_AUDIT_SESSION_DIR is None:
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         EXEC_AUDIT_SESSION_DIR = EXEC_AUDIT_ROOT / timestamp
         EXEC_AUDIT_SESSION_DIR.mkdir(parents=True, exist_ok=True)
-        _prune_old_exec_sessions()
+    _prune_old_exec_sessions()
     return EXEC_AUDIT_SESSION_DIR
 
 
@@ -63,15 +67,29 @@ def _get_exec_audit_folder_size() -> int:
 
 
 def _prune_old_exec_sessions() -> None:
-    """Delete oldest session folders until under size limit (FIFO)."""
+    """Delete the oldest audit files (FIFO by mtime) until under the size cap.
+
+    Runs at individual-file granularity rather than whole session folders, so
+    a single long-running session that alone exceeds the cap gets pruned too -
+    not just stale folders left over from previous runs. Always keeps at
+    least one file, and never removes the directory currently in use for this
+    process's own session - even though it is momentarily empty right after
+    creation, a file is about to be written into it by the caller.
+    """
     max_bytes = EXEC_AUDIT_MAX_SIZE_MB * 1024 * 1024
     while _get_exec_audit_folder_size() > max_bytes:
-        sessions = sorted([d for d in EXEC_AUDIT_ROOT.iterdir() if d.is_dir()])
-        if len(sessions) <= 1:
-            break
-        oldest = sessions[0]
         try:
-            shutil.rmtree(oldest)
+            files = [f for f in EXEC_AUDIT_ROOT.rglob("*") if f.is_file()]
+        except OSError:
+            break
+        if len(files) <= 1:
+            break
+        try:
+            oldest = min(files, key=lambda f: f.stat().st_mtime)
+            parent = oldest.parent
+            oldest.unlink()
+            if parent != EXEC_AUDIT_SESSION_DIR and parent.is_dir() and not any(parent.iterdir()):
+                parent.rmdir()
         except OSError:
             break
 
@@ -106,7 +124,9 @@ MAX_SOURCE_LINES = 2_000       # 2k lines
 MAX_AST_NODES    = 20_000      # 20k nodes
 MAX_AST_DEPTH    = 100         # depth limit
 EXECUTION_TIMEOUT_SECONDS = max(1, int(os.getenv("PYTHON_EXEC_TIMEOUT", "30")))  # 30s default
-MAX_MEMORY_BYTES = int(os.getenv("PYTHON_EXEC_MAX_MEMORY", str(8 * 1024 * 1024 * 1024)))  # 8GB (worker-enforced, POSIX)
+# PYTHON_EXEC_MAX_MEMORY (8GB default, POSIX/RLIMIT_AS only) is read and
+# enforced entirely inside the worker (_python_worker.py) - not here, since
+# the limit applies to the worker's own process, not this parent.
 
 
 class ResourceLimitError(Exception):

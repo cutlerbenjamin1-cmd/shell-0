@@ -28,13 +28,18 @@ AUDIT_SESSION_DIR: Optional[Path] = None  # Initialized on first audit write
 
 
 def _get_audit_session_dir() -> Path:
-    """Get or create the current session's audit directory."""
+    """Get or create the current session's audit directory.
+
+    Prunes on every call, not just when the session directory is first
+    created - otherwise a single long-running process's own audit growth is
+    never re-checked against the size cap after the first write.
+    """
     global AUDIT_SESSION_DIR
     if AUDIT_SESSION_DIR is None:
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         AUDIT_SESSION_DIR = AUDIT_ROOT / timestamp
         AUDIT_SESSION_DIR.mkdir(parents=True, exist_ok=True)
-        _prune_old_sessions()
+    _prune_old_sessions()
     return AUDIT_SESSION_DIR
 
 
@@ -52,17 +57,30 @@ def _get_audit_folder_size() -> int:
 
 
 def _prune_old_sessions() -> None:
-    """Delete oldest session folders until under size limit (FIFO)."""
+    """Delete the oldest audit files (FIFO by mtime) until under the size cap.
+
+    Runs at individual-file granularity rather than whole session folders, so
+    a single long-running session that alone exceeds the cap gets pruned too -
+    not just stale folders left over from previous runs. Always keeps at
+    least one file, and never removes the directory currently in use for this
+    process's own session - even though it is momentarily empty right after
+    creation, a file is about to be written into it by the caller.
+    """
     max_bytes = AUDIT_MAX_SIZE_MB * 1024 * 1024
-    
+
     while _get_audit_folder_size() > max_bytes:
-        # Get all session dirs sorted by name (oldest first due to timestamp format)
-        sessions = sorted([d for d in AUDIT_ROOT.iterdir() if d.is_dir()])
-        if len(sessions) <= 1:
-            break  # Keep at least current session
-        oldest = sessions[0]
         try:
-            shutil.rmtree(oldest)
+            files = [f for f in AUDIT_ROOT.rglob("*") if f.is_file()]
+        except OSError:
+            break
+        if len(files) <= 1:
+            break
+        try:
+            oldest = min(files, key=lambda f: f.stat().st_mtime)
+            parent = oldest.parent
+            oldest.unlink()
+            if parent != AUDIT_SESSION_DIR and parent.is_dir() and not any(parent.iterdir()):
+                parent.rmdir()
         except OSError:
             break
 
@@ -72,9 +90,14 @@ def _log_access(action: str, path: str, details: str = "") -> None:
     if AUDIT_DISABLED:
         return
     try:
-        # Skip logging access to the audit directory itself (prevents noise)
-        if str(AUDIT_ROOT) in path:
+        # Skip logging access to the audit directory itself (prevents noise).
+        # Proper path containment, not a substring check - a real path that
+        # merely contains AUDIT_ROOT's text somewhere in it must still be logged.
+        try:
+            Path(path).relative_to(AUDIT_ROOT.resolve())
             return
+        except ValueError:
+            pass
         session_dir = _get_audit_session_dir()
         log_file = session_dir / "access.log"
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -449,11 +472,6 @@ async def write_file(
     try:
         full = _resolve_path(path)
         dirpath = full.parent
-        
-        # Audit logging - log before-state for destructive writes
-        if mode in ("overwrite", "replace_lines"):
-            before_content = _read_file_for_audit(full)
-            _log_destructive_op("write", str(full), before_content)
 
         # Apply autofixes; standalone syntax rejection only makes sense for
         # full overwrites - append/insert/replace_lines fragments are validated
@@ -477,6 +495,23 @@ async def write_file(
                 "success": False,
                 "error": f"Path conflict: '{dirpath}' exists as a file, not a directory."
             }
+
+        # replace_lines needs a positive limit. Reject here, alongside the other
+        # guards and before the audit log, so a bad call leaves no phantom audit
+        # snapshot for a write that never touches disk.
+        if mode == "replace_lines" and limit <= 0:
+            return {
+                "success": False,
+                "error": "replace_lines mode requires limit > 0 (number of lines to replace). Use 'insert' mode to add without replacing."
+            }
+
+        # Audit logging - log before-state for destructive writes. Logged only
+        # after the guards above pass, so a write rejected for a syntax error,
+        # a path conflict, or a bad replace_lines limit never leaves a phantom
+        # audit entry for a write that never touched disk.
+        if mode in ("overwrite", "replace_lines"):
+            before_content = _read_file_for_audit(full)
+            _log_destructive_op("write", str(full), before_content)
 
         def _write_with_mode():
             dirpath.mkdir(parents=True, exist_ok=True)
@@ -538,9 +573,8 @@ async def write_file(
                     # Insert at offset, pushing existing lines down
                     new_lines = existing_lines[:internal_offset] + content_lines + existing_lines[internal_offset:]
                 else:  # replace_lines
-                    # Replace 'limit' lines starting at offset - limit must be > 0
-                    if limit <= 0:
-                        raise ValueError("replace_lines mode requires limit > 0 (number of lines to replace). Use 'insert' mode to add without replacing.")
+                    # limit > 0 is enforced by the caller guard above, before
+                    # any audit log fires.
                     end_idx = internal_offset + limit
                     new_lines = existing_lines[:internal_offset] + content_lines + existing_lines[end_idx:]
 
@@ -740,13 +774,19 @@ async def list_directory(path: str = ".", include_metadata: bool = False) -> Dic
             entries = []
             for p in full.iterdir():
                 if include_metadata:
-                    stat = p.stat()
-                    entries.append({
-                        "name": p.name,
-                        "type": "dir" if p.is_dir() else "file",
-                        "size": stat.st_size if p.is_file() else None,
-                        "mtime": stat.st_mtime
-                    })
+                    # A single broken symlink or permission-denied entry (common
+                    # enough on Windows with reparse points/OneDrive placeholders)
+                    # must not fail the whole listing - just report what's known.
+                    try:
+                        stat = p.stat()
+                        entries.append({
+                            "name": p.name,
+                            "type": "dir" if p.is_dir() else "file",
+                            "size": stat.st_size if p.is_file() else None,
+                            "mtime": stat.st_mtime
+                        })
+                    except OSError as e:
+                        entries.append({"name": p.name, "type": "unknown", "error": str(e)})
                 else:
                     entries.append(p.name)
             return entries
@@ -1370,7 +1410,7 @@ async def find_duplicates(path: str = "", pattern: str = "*", algorithm: str = "
         if not full.is_dir():
             return {"success": False, "error": f"Directory not found: {path}"}
 
-        algo_map = {"md5": hashlib.md5, "sha1": hashlib.sha1, "sha256": hashlib.sha256}
+        algo_map = {"md5": hashlib.md5, "sha1": hashlib.sha1, "sha256": hashlib.sha256, "sha512": hashlib.sha512}
         if algorithm.lower() not in algo_map:
             return {"success": False, "error": f"Unknown algorithm: {algorithm}"}
         hash_func = algo_map[algorithm.lower()]
@@ -1420,7 +1460,7 @@ async def find_duplicates(path: str = "", pattern: str = "*", algorithm: str = "
 async def fs(
     action: str,
     path: str = "",
-    content: str = "",
+    content: Optional[str] = None,
     destination: str = "",
     pattern: str = "",
     recursive: bool = False,
@@ -1583,4 +1623,5 @@ async def fs(
 # Exported for server registration
 __all__ = ["fs", "read_file", "write_file", "edit_file", "delete_file", "copy_file",
            "move_path", "create_directory", "delete_directory",
-           "list_directory", "directory_tree", "search_files", "grep_files", "stat_file"]
+           "list_directory", "directory_tree", "search_files", "grep_files", "stat_file",
+           "diff_content", "hash_file", "touch_file", "head_file", "tail_file", "find_duplicates"]

@@ -91,6 +91,8 @@ All optional, set as environment variables:
 - `FS_AUDIT_MAX_MB` / `EXEC_AUDIT_MAX_MB` - audit size cap before pruning (default: 50).
 - `OUTPUT_MAX_CHARS` - hard cap on a single tool result before it gets truncated (default: 15000).
 - `PYTHON_EXEC_TIMEOUT` - `python_exec` timeout in seconds (default: 30).
+- `PYTHON_EXEC_MAX_MEMORY` - `python_exec` worker address-space cap in bytes (default: 8GB). POSIX only (RLIMIT_AS); no-op on Windows, which has no equivalent cheap hard cap.
+- `PYTHON_EXEC_MAX_OUTPUT` - max captured stdout/stderr chars per `python_exec` call before clipping (default: 1,000,000).
 - `MCP_DEBUG` - set to `true` for stderr debug logging.
 
 ## A word on safety

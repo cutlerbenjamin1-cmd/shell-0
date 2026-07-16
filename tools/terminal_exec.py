@@ -7,7 +7,6 @@ import platform
 import subprocess
 import time
 import os
-import shutil
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -28,13 +27,18 @@ EXEC_AUDIT_SESSION_DIR: Optional[Path] = None
 
 
 def _get_exec_audit_session_dir() -> Path:
-    """Get or create the current session's audit directory."""
+    """Get or create the current session's audit directory.
+
+    Prunes on every call, not just when the session directory is first
+    created - otherwise a single long-running process's own audit growth is
+    never re-checked against the size cap after the first write.
+    """
     global EXEC_AUDIT_SESSION_DIR
     if EXEC_AUDIT_SESSION_DIR is None:
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         EXEC_AUDIT_SESSION_DIR = EXEC_AUDIT_ROOT / timestamp
         EXEC_AUDIT_SESSION_DIR.mkdir(parents=True, exist_ok=True)
-        _prune_old_exec_sessions()
+    _prune_old_exec_sessions()
     return EXEC_AUDIT_SESSION_DIR
 
 
@@ -52,15 +56,29 @@ def _get_exec_audit_folder_size() -> int:
 
 
 def _prune_old_exec_sessions() -> None:
-    """Delete oldest session folders until under size limit (FIFO)."""
+    """Delete the oldest audit files (FIFO by mtime) until under the size cap.
+
+    Runs at individual-file granularity rather than whole session folders, so
+    a single long-running session that alone exceeds the cap gets pruned too -
+    not just stale folders left over from previous runs. Always keeps at
+    least one file, and never removes the directory currently in use for this
+    process's own session - even though it is momentarily empty right after
+    creation, a file is about to be written into it by the caller.
+    """
     max_bytes = EXEC_AUDIT_MAX_SIZE_MB * 1024 * 1024
     while _get_exec_audit_folder_size() > max_bytes:
-        sessions = sorted([d for d in EXEC_AUDIT_ROOT.iterdir() if d.is_dir()])
-        if len(sessions) <= 1:
-            break
-        oldest = sessions[0]
         try:
-            shutil.rmtree(oldest)
+            files = [f for f in EXEC_AUDIT_ROOT.rglob("*") if f.is_file()]
+        except OSError:
+            break
+        if len(files) <= 1:
+            break
+        try:
+            oldest = min(files, key=lambda f: f.stat().st_mtime)
+            parent = oldest.parent
+            oldest.unlink()
+            if parent != EXEC_AUDIT_SESSION_DIR and parent.is_dir() and not any(parent.iterdir()):
+                parent.rmdir()
         except OSError:
             break
 
@@ -133,13 +151,20 @@ def _bg_cleanup() -> None:
         del BACKGROUND_TASKS[tid]
 
 
-def _kill_proc(proc: asyncio.subprocess.Process) -> None:
-    """Kill a process, handling Windows process trees."""
+async def _kill_proc(proc: asyncio.subprocess.Process) -> None:
+    """Kill a process, handling Windows process trees.
+
+    taskkill runs off the event loop (asyncio.to_thread) - this used to call
+    the blocking subprocess.run directly, which stalled the whole single-
+    threaded event loop (and every other in-flight MCP tool call) for up to
+    its 5s timeout on every foreground timeout and every bg_kill.
+    """
     if platform.system() == "Windows" and proc.pid:
         try:
-            subprocess.run(
+            await asyncio.to_thread(
+                subprocess.run,
                 ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
-                capture_output=True, timeout=5
+                capture_output=True, timeout=5,
             )
         except Exception:
             pass
@@ -178,7 +203,7 @@ async def _bg_collector(task: BackgroundTask, timeout: float) -> None:
         task.output = _cap_output(output)
 
     except asyncio.TimeoutError:
-        _kill_proc(task.proc)
+        await _kill_proc(task.proc)
         await task.proc.wait()
         task.status = "timeout"
         task.exit_code = -1
@@ -206,7 +231,6 @@ async def terminal_exec(
     bg_status: str = "",
     bg_kill: str = "",
     bg_list: bool = False,
-    visible: bool = False,  # ignored, kept for API compat
     description: str = "",  # ignored, kept for API compat
 ) -> Dict:
     """Execute shell commands, with background task management."""
@@ -242,6 +266,7 @@ async def terminal_exec(
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     cwd=cwd,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
                 )
             else:
                 proc = await asyncio.create_subprocess_shell(
@@ -262,6 +287,14 @@ async def terminal_exec(
         )
         task._collector = asyncio.create_task(_bg_collector(task, timeout))
         BACKGROUND_TASKS[task_id] = task
+        # Log the launch itself, not just completion/kill - otherwise a
+        # background task that's still running when the process dies (crash,
+        # restart) leaves no audit trace that it ever ran.
+        _log_terminal_exec(
+            command, cwd=cwd, success=True, exit_code=-1,
+            output=f"[Background task {task_id} started, pid={proc.pid}. This entry "
+                   "records the launch only; completion/kill is logged separately.]",
+        )
         return {
             "success": True, "background": True, "task_id": task_id,
             "command": command, "cwd": cwd, "pid": proc.pid,
@@ -279,6 +312,7 @@ async def terminal_exec(
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=cwd,
+                creationflags=subprocess.CREATE_NO_WINDOW,
             )
         else:
             proc = await asyncio.create_subprocess_shell(
@@ -296,7 +330,7 @@ async def terminal_exec(
             stderr_str = stderr.decode("utf-8", errors="replace") if stderr else ""
             exit_code = proc.returncode
         except asyncio.TimeoutError:
-            _kill_proc(proc)
+            await _kill_proc(proc)
             await proc.wait()
             _log_terminal_exec(command, cwd=cwd, success=False, error=f"Timeout after {timeout}s")
             return {
@@ -376,7 +410,7 @@ async def _do_bg_kill(task_id: str) -> Dict:
     if task.status != "running":
         return {"success": False, "error": f"Task '{task_id}' is already {task.status}."}
     
-    _kill_proc(task.proc)
+    await _kill_proc(task.proc)
     task.status = "killed"
     task.end_time = time.time()
     task.exit_code = -9
