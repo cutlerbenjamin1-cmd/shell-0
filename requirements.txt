@@ -2,7 +2,7 @@
 # Tested with mcp 1.22.0 on Python 3.12. Upper-bounded because server.py patches
 # mcp.shared.session internals (the cancel/respond race fix); a major SDK bump
 # could move or rename them.
-mcp>=1.2.0,<2
+mcp>=1.22.0,<2
 
 # js_exec also needs Node.js on PATH (tested with Node 24). Not a pip package;
 # install from https://nodejs.org if you want the js_exec tool.

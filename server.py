@@ -367,7 +367,13 @@ def _truncate_output(payload: dict, tool_name: str = "") -> dict:
     actual_len = len(text)
     log(f"[WARN] Output truncated: {actual_len} -> ~{OUTPUT_MAX_CHARS} chars")
 
-    content_fields = ["content", "output", "result", "data", "text"]
+    # "error" included so a failing call with a huge error string (a giant
+    # traceback, stderr echoed into the error field) gets truncated like any
+    # other oversized field, instead of silently vanishing: it isn't in the
+    # fallback envelope's key allowlist below, so without this a truncated
+    # failure would report only a generic "Response too large" note and lose
+    # the actual failure reason entirely.
+    content_fields = ["content", "output", "result", "data", "text", "error"]
     max_field_chars = OUTPUT_MAX_CHARS - 500  # Leave room for metadata
 
     for field in content_fields:

@@ -10,6 +10,7 @@ import fnmatch
 import tempfile
 import difflib
 import hashlib
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, List, Optional
@@ -155,7 +156,6 @@ def _read_file_for_audit(path: Path) -> Optional[str]:
 
 MAX_READ_BYTES = int(os.getenv("FS_MAX_READ_BYTES", str(50 * 1024 * 1024)))  # 50MB default
 MAX_TREE_DEPTH = int(os.getenv("FS_MAX_TREE_DEPTH", "15"))  # Deep traversal for projects
-MAX_RECURSIVE_DELETE_DEPTH = int(os.getenv("FS_MAX_DELETE_DEPTH", "10"))
 
 # No WORKING_ROOT restriction - full filesystem access
 SANDBOXED = False
@@ -390,36 +390,46 @@ async def read_file(path: str, offset: int = 1, limit: int = 0) -> Dict[str, Any
                 "error": f"File too large ({size:,} bytes). Max: {MAX_READ_BYTES:,} bytes. Use offset/limit for chunked reading."
             }
 
-        def _read():
-            # Try UTF-8 first, fall back to latin-1 for binary-ish files
-            try:
-                with open(full, "r", encoding="utf-8") as f:
-                    lines = f.readlines()
-            except UnicodeDecodeError:
-                try:
-                    with open(full, "r", encoding="latin-1") as f:
-                        lines = f.readlines()
-                except Exception:
-                    return None, f"[Binary file: {size:,} bytes - cannot display as text]"
-            return lines, None
-
-        lines, error = await asyncio.to_thread(_read)
-
-        if error:
-            return {"success": True, "path": str(full), "content": error, "size": size, "binary": True}
-
-        total_lines = len(lines)
-
         # Convert 1-based offset to 0-based internal index
         # offset=0 or offset=1 both mean "start from first line" (backwards compat)
         internal_offset = max(0, offset - 1) if offset > 0 else 0
+        chunked = internal_offset > 0 or limit > 0
 
-        # Apply offset and limit
-        if internal_offset > 0 or limit > 0:
+        def _read(encoding):
+            if not chunked:
+                # Full read: the caller wants everything anyway, and it's
+                # already bounded by the MAX_READ_BYTES check above - nothing
+                # to gain from streaming here.
+                with open(full, "r", encoding=encoding) as f:
+                    lines = f.readlines()
+                return lines, len(lines)
+
+            # Chunked read: stream instead of materializing the whole file, so
+            # memory use stays O(limit) rather than O(file size) - the entire
+            # point of offset/limit chunking on a file too big to read whole.
+            selected = []
+            total = 0
+            end = None if limit == 0 else internal_offset + limit
+            with open(full, "r", encoding=encoding) as f:
+                for i, line in enumerate(f):
+                    total += 1
+                    if i >= internal_offset and (end is None or i < end):
+                        selected.append(line)
+            return selected, total
+
+        try:
+            lines, total_lines = await asyncio.to_thread(_read, "utf-8")
+        except UnicodeDecodeError:
+            try:
+                lines, total_lines = await asyncio.to_thread(_read, "latin-1")
+            except Exception:
+                error = f"[Binary file: {size:,} bytes - cannot display as text]"
+                return {"success": True, "path": str(full), "content": error, "size": size, "binary": True}
+
+        if chunked:
             start = min(internal_offset, total_lines)
             end = total_lines if limit == 0 else min(start + limit, total_lines)
-            selected_lines = lines[start:end]
-            content = "".join(selected_lines)
+            content = "".join(lines)
             has_more = end < total_lines
 
             return {
@@ -429,7 +439,7 @@ async def read_file(path: str, offset: int = 1, limit: int = 0) -> Dict[str, Any
                 "size": size,
                 "total_lines": total_lines,
                 "offset": start + 1,  # Return 1-based offset
-                "lines_returned": len(selected_lines),
+                "lines_returned": len(lines),
                 "has_more": has_more
             }
         else:
@@ -505,13 +515,15 @@ async def write_file(
                 "error": "replace_lines mode requires limit > 0 (number of lines to replace). Use 'insert' mode to add without replacing."
             }
 
-        # Audit logging - log before-state for destructive writes. Logged only
-        # after the guards above pass, so a write rejected for a syntax error,
-        # a path conflict, or a bad replace_lines limit never leaves a phantom
-        # audit entry for a write that never touched disk.
-        if mode in ("overwrite", "replace_lines"):
-            before_content = _read_file_for_audit(full)
-            _log_destructive_op("write", str(full), before_content)
+        # Audit logging - log before-state for every write mode (not just
+        # overwrite/replace_lines). append/insert don't destroy existing
+        # content, but they do change the file, and the audit system's promise
+        # is that every write is recorded - not just the ones that can lose
+        # data. Logged only after the guards above pass, so a write rejected
+        # for a syntax error, a path conflict, or a bad replace_lines limit
+        # never leaves a phantom audit entry for a write that never touched disk.
+        before_content = _read_file_for_audit(full)
+        _log_destructive_op("write", str(full), before_content)
 
         def _write_with_mode():
             dirpath.mkdir(parents=True, exist_ok=True)
@@ -646,6 +658,12 @@ async def copy_file(source: str, destination: str) -> Dict[str, Any]:
                 "error": f"Path conflict: '{dst_dir}' exists as a file, not a directory."
             }
 
+        # shutil.copy2 silently overwrites an existing destination file with no
+        # guardrail of its own - snapshot whatever is about to be clobbered so
+        # it stays recoverable, same guarantee write_file gives an overwrite.
+        if full_dst.is_file():
+            _log_destructive_op("copy-overwrite", str(full_dst), _read_file_for_audit(full_dst))
+
         def _mkdir_and_copy():
             dst_dir.mkdir(parents=True, exist_ok=True)
             shutil.copy2(str(full_src), str(full_dst))
@@ -669,6 +687,13 @@ async def move_path(source: str, destination: str) -> Dict[str, Any]:
                 "success": False,
                 "error": f"Path conflict: '{dst_dir}' exists as a file, not a directory."
             }
+
+        # shutil.move silently overwrites an existing destination file (via
+        # os.rename on POSIX, or copy+unlink on Windows where rename refuses an
+        # existing target) - snapshot it first so an accidental move-over-write
+        # is recoverable, same as write_file's overwrite mode.
+        if full_dst.is_file():
+            _log_destructive_op("move-overwrite", str(full_dst), _read_file_for_audit(full_dst))
 
         def _mkdir_and_move():
             dst_dir.mkdir(parents=True, exist_ok=True)
@@ -756,6 +781,7 @@ async def delete_directory(path: str, recursive: bool = False, confirm: bool = F
             await asyncio.to_thread(shutil.rmtree, str(full))
             return {"success": True, "path": str(full), "items_removed": item_count}
         else:
+            _log_access("rmdir", str(full), "empty directory")
             await asyncio.to_thread(full.rmdir)
             return {"success": True, "path": str(full)}
 
@@ -1346,6 +1372,7 @@ async def touch_file(path: str, create_parents: bool = True) -> Dict[str, Any]:
         if create_parents:
             full.parent.mkdir(parents=True, exist_ok=True)
         full.touch()
+        _log_access("touch", str(full), "created" if not existed else "mtime updated")
         return {"success": True, "path": str(full), "created": not existed, "mtime": full.stat().st_mtime}
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -1356,45 +1383,66 @@ async def touch_file(path: str, create_parents: bool = True) -> Dict[str, Any]:
 # =====================================================================================
 
 async def head_file(path: str, lines: int = 10) -> Dict[str, Any]:
-    """Read the first N lines of a file."""
+    """Read the first N lines of a file.
+
+    Streams line-by-line instead of loading the whole file: memory use stays
+    O(lines) rather than O(file size), which matters since this exists
+    precisely to let a caller peek at a file too big to read in full.
+    """
     try:
         full = _resolve_path(path)
         if not full.is_file():
             return {"success": False, "error": f"File not found: {path}"}
 
-        def _read():
-            try:
-                with open(full, "r", encoding="utf-8") as f:
-                    return f.readlines()
-            except UnicodeDecodeError:
-                with open(full, "r", encoding="latin-1") as f:
-                    return f.readlines()
+        def _read(encoding):
+            selected = []
+            total = 0
+            with open(full, "r", encoding=encoding) as f:
+                for line in f:
+                    total += 1
+                    if total <= lines:
+                        selected.append(line)
+            return selected, total
 
-        all_lines = await asyncio.to_thread(_read)
-        selected = all_lines[:lines]
-        return {"success": True, "path": str(full), "content": "".join(selected), "lines_returned": len(selected), "total_lines": len(all_lines), "has_more": len(all_lines) > lines}
+        try:
+            selected, total_lines = await asyncio.to_thread(_read, "utf-8")
+        except UnicodeDecodeError:
+            selected, total_lines = await asyncio.to_thread(_read, "latin-1")
+
+        return {"success": True, "path": str(full), "content": "".join(selected), "lines_returned": len(selected), "total_lines": total_lines, "has_more": total_lines > lines}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 
 async def tail_file(path: str, lines: int = 10) -> Dict[str, Any]:
-    """Read the last N lines of a file."""
+    """Read the last N lines of a file.
+
+    Streams forward through the file with a bounded deque instead of loading
+    it all into a list: memory use stays O(lines) rather than O(file size).
+    I/O is still a full linear pass (there is no cheap seek-from-end for
+    variable-length text lines), but that is a time cost, not a memory-
+    exhaustion risk.
+    """
     try:
         full = _resolve_path(path)
         if not full.is_file():
             return {"success": False, "error": f"File not found: {path}"}
 
-        def _read():
-            try:
-                with open(full, "r", encoding="utf-8") as f:
-                    return f.readlines()
-            except UnicodeDecodeError:
-                with open(full, "r", encoding="latin-1") as f:
-                    return f.readlines()
+        def _read(encoding):
+            buf = deque(maxlen=lines if lines > 0 else 0)
+            total = 0
+            with open(full, "r", encoding=encoding) as f:
+                for line in f:
+                    total += 1
+                    buf.append(line)
+            return list(buf), total
 
-        all_lines = await asyncio.to_thread(_read)
-        selected = all_lines[-lines:] if lines < len(all_lines) else all_lines
-        return {"success": True, "path": str(full), "content": "".join(selected), "lines_returned": len(selected), "total_lines": len(all_lines), "start_line": max(1, len(all_lines) - lines + 1)}
+        try:
+            selected, total_lines = await asyncio.to_thread(_read, "utf-8")
+        except UnicodeDecodeError:
+            selected, total_lines = await asyncio.to_thread(_read, "latin-1")
+
+        return {"success": True, "path": str(full), "content": "".join(selected), "lines_returned": len(selected), "total_lines": total_lines, "start_line": max(1, total_lines - lines + 1)}
     except Exception as e:
         return {"success": False, "error": str(e)}
 

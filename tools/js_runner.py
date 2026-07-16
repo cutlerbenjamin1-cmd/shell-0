@@ -7,6 +7,8 @@ lightweight resource guards and persistent state on disk.
 import asyncio
 import contextlib
 import os
+import platform
+import signal
 import subprocess
 import tempfile
 import shutil
@@ -227,6 +229,36 @@ def _truncate_output(text: str) -> Tuple[str, bool]:
     return text[:MAX_OUTPUT_SIZE], True
 
 
+async def _kill_node_proc(proc: "asyncio.subprocess.Process") -> None:
+    """Kill the node process AND anything it spawned (e.g. child_process.spawn
+    from user code), not just the immediate PID.
+
+    Mirrors terminal_exec._kill_proc: a bare proc.kill() only signals the node
+    process itself. On Windows that leaves grandchildren orphaned; on POSIX,
+    SIGKILL can't be caught or forwarded, so a killed shell/node parent never
+    gets a chance to propagate it to children it spawned. The process is
+    started with start_new_session=True (POSIX) precisely so it has its own
+    process group here to kill as a unit.
+    """
+    if platform.system() == "Windows" and proc.pid:
+        try:
+            await asyncio.to_thread(
+                subprocess.run,
+                ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                capture_output=True, timeout=5,
+            )
+        except Exception:
+            pass
+    elif proc.pid:
+        try:
+            pgid = os.getpgid(proc.pid)
+            os.killpg(pgid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    with contextlib.suppress(ProcessLookupError):
+        proc.kill()
+
+
 async def exec_js(code: str, timeout: float = None) -> dict:
     """
     Execute JavaScript code via Node.js. UNLOCKED.
@@ -272,6 +304,11 @@ async def exec_js(code: str, timeout: float = None) -> dict:
         popen_kwargs = {"cwd": cwd}
         if creationflags:
             popen_kwargs["creationflags"] = creationflags
+        else:
+            # POSIX: run node in its own process group so a timeout kill can
+            # take out anything it spawned (see _kill_node_proc), not just
+            # the node process itself.
+            popen_kwargs["start_new_session"] = True
 
         process = await asyncio.create_subprocess_exec(
             node_path,
@@ -286,7 +323,7 @@ async def exec_js(code: str, timeout: float = None) -> dict:
         try:
             stdout_bytes, stderr_bytes = await asyncio.wait_for(process.communicate(), timeout_seconds)
         except asyncio.TimeoutError as exc:
-            process.kill()
+            await _kill_node_proc(process)
             with contextlib.suppress(Exception):
                 await process.communicate()
             _log_js_exec(code, success=False, error="Timeout")

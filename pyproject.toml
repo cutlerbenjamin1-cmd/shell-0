@@ -16,7 +16,7 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    "mcp>=1.2.0,<2",
+    "mcp>=1.22.0,<2",
 ]
 
 [project.optional-dependencies]

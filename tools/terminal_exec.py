@@ -4,6 +4,7 @@ Simple asyncio subprocess with proper stdin isolation.
 """
 import asyncio
 import platform
+import signal
 import subprocess
 import time
 import os
@@ -152,12 +153,18 @@ def _bg_cleanup() -> None:
 
 
 async def _kill_proc(proc: asyncio.subprocess.Process) -> None:
-    """Kill a process, handling Windows process trees.
+    """Kill a process, handling process trees on both platforms.
 
     taskkill runs off the event loop (asyncio.to_thread) - this used to call
     the blocking subprocess.run directly, which stalled the whole single-
     threaded event loop (and every other in-flight MCP tool call) for up to
     its 5s timeout on every foreground timeout and every bg_kill.
+
+    On POSIX, SIGKILL can't be caught or forwarded, so killing only the shell
+    process (proc.kill()) never gives it a chance to propagate the signal to
+    anything it forked (pipelines, `cmd &` background jobs). The shell is
+    spawned with start_new_session=True precisely so it has its own process
+    group here to kill as a unit, mirroring the Windows taskkill /T behavior.
     """
     if platform.system() == "Windows" and proc.pid:
         try:
@@ -167,6 +174,12 @@ async def _kill_proc(proc: asyncio.subprocess.Process) -> None:
                 capture_output=True, timeout=5,
             )
         except Exception:
+            pass
+    elif proc.pid:
+        try:
+            pgid = os.getpgid(proc.pid)
+            os.killpg(pgid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
             pass
     try:
         proc.kill()
@@ -276,6 +289,7 @@ async def terminal_exec(
                     stderr=asyncio.subprocess.PIPE,
                     executable="/bin/bash",
                     cwd=cwd,
+                    start_new_session=True,
                 )
         except Exception as e:
             return {"success": False, "error": f"Failed to spawn background task: {e}"}
@@ -322,6 +336,7 @@ async def terminal_exec(
                 stderr=asyncio.subprocess.PIPE,
                 executable="/bin/bash",
                 cwd=cwd,
+                start_new_session=True,
             )
         
         try:
