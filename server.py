@@ -227,8 +227,8 @@ _TOOL_REGISTRY.register(
         "Execute shell commands. Returns {success, output, exit_code, duration_seconds}. "
         "Use for: git, npm, pip, system commands, anything requiring shell. "
         "UNRESTRICTED - full privileges, no sandboxing. "
-        "Windows: cmd.exe, Unix: bash. Timeout: 120s default, 600s max. "
-        "Background: run_in_background=true returns task_id. Use bg_status/bg_kill/bg_list to manage. "
+        "Windows: cmd.exe, Unix: bash. Process is KILLED at timeout (hard max 600s); default 120s foreground / 600s background. "
+        "Background: run_in_background=true returns task_id; pass timeout=600 for long jobs. Use bg_status/bg_kill/bg_list to manage. For jobs >600s launch detached via 'powershell Start-Process -WindowStyle Hidden' and self-log to a file. "
         "For file ops prefer fs; for Python prefer python_exec."
     ),
     input_schema={
@@ -239,7 +239,7 @@ _TOOL_REGISTRY.register(
                 "description": "Shell command to execute. Supports pipes, redirects, chaining (&&, ||)."
             },
             "cwd": {"type": "string", "description": "Working directory. Default: current dir."},
-            "timeout": {"type": "number", "description": "Timeout in seconds. Default: 120. Max: 600."},
+            "timeout": {"type": "number", "description": "Seconds before the process is KILLED. Default: 120 foreground / 600 background. Max: 600. For >600s jobs launch detached via 'powershell Start-Process -WindowStyle Hidden' and log to a file."},
             "run_in_background": {"type": "boolean", "description": "Run command in background, return task_id immediately. Default: false."},
             "bg_status": {"type": "string", "description": "Get status/output of a background task by task_id."},
             "bg_kill": {"type": "string", "description": "Kill a running background task by task_id."},

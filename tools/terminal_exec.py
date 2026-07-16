@@ -201,7 +201,7 @@ async def _bg_collector(task: BackgroundTask, timeout: float) -> None:
 async def terminal_exec(
     command: str = "",
     cwd: Optional[str] = None,
-    timeout: float = 120.0,
+    timeout: Optional[float] = None,
     run_in_background: bool = False,
     bg_status: str = "",
     bg_kill: str = "",
@@ -223,6 +223,10 @@ async def terminal_exec(
         return {"success": False, "error": "Command must be a non-empty string."}
     
     start = time.time()
+    # Foreground defaults to 120s; background defaults to the 600s ceiling so
+    # long jobs aren't silently killed at the foreground default.
+    if timeout is None:
+        timeout = 600.0 if run_in_background else 120.0
     timeout = min(max(timeout, 1), 600)
     
     if run_in_background:

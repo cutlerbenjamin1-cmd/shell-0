@@ -939,6 +939,7 @@ async def edit_file(
                 tofile=f"b/{full.name}"
             ))
 
+        wrote = False
         if not dry_run and changes_made and edits_failed == 0:
             # Atomic write
             fd, temp = tempfile.mkstemp(dir=str(full.parent), suffix=".tmp")
@@ -952,17 +953,31 @@ async def edit_file(
                 except OSError:
                     pass
                 raise
+            wrote = True
 
-        return {
+        result = {
             "success": edits_failed == 0,
             "path": str(full),
             "dry_run": dry_run,
-            "changes_made": changes_made,
-            "diff": diff,
+            "written": wrote,
+            "changes_made": changes_made if (wrote or dry_run) else False,
+            "diff": diff if (wrote or dry_run) else "",
             "match_results": match_results,
             "edits_applied": edits_applied,
-            "edits_failed": edits_failed
+            "edits_failed": edits_failed,
         }
+        if edits_failed > 0:
+            # Atomic rollback: nothing hit disk. Scrub the applied-looking
+            # signals so the report matches disk truth; keep failure reasons.
+            for m in match_results:
+                if m.get("status") == "applied":
+                    m["status"] = "rolled_back"
+            result["warning"] = (
+                f"ROLLED BACK - {edits_failed} edit(s) did not match, so the whole batch was "
+                f"discarded and NOTHING was written to disk. Any 'applied' edits were undone. "
+                f"Fix the failed old_text (see match_results reasons) and re-run so ALL edits match."
+            )
+        return result
     except Exception as e:
         return {"success": False, "error": str(e)}
 
