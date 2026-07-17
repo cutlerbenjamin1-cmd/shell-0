@@ -150,7 +150,8 @@ _TOOL_REGISTRY.register(
         "Use for: data processing, file operations, API calls, system automation, any Python task. "
         "Prefer over js_exec unless JS-specific features needed. "
         "UNLOCKED: all imports (os, subprocess, requests, pathlib), file I/O, network access. "
-        "Persistent state via module-level variables across calls. "
+        "State persists across calls via a reused worker subprocess, but a timeout or "
+        "crash kills the worker and resets that state on the next call. "
         "Limits: 30s timeout (PYTHON_EXEC_TIMEOUT env), 100k chars, 2k lines, 20k AST nodes."
     ),
     input_schema={
